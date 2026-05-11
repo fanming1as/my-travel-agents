@@ -1,0 +1,13 @@
+# 1. 忽略 Python 的运行缓存 (不然每次运行都会产生大量垃圾文件)
+__pycache__/
+*.py[cod]
+
+.env
+venv/
+node_modules/
+__pycache__/
+*.pyc
+backend/app/data/*.db
+backend/debug_logs/
+frontend/dist/
+.DS_Store
