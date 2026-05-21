@@ -3,7 +3,7 @@
 import uuid
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from ...models.schemas import TripRequest, TripPlanResponse, ErrorResponse
+from ...models.schemas import TripRequest
 from ...agents.test import get_trip_planner_agent
 from ...memory.episodic_manager import EpisodicMemoryManager
 
@@ -96,6 +96,5 @@ async def submit_trip_feedback(req: FeedbackRequest):
         return {"status": "success", "message": "记忆已成功刻入双引擎存储库。"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
-
 
 
