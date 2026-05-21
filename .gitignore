@@ -6,8 +6,11 @@ __pycache__/
 venv/
 node_modules/
 __pycache__/
+*.py[cod]
 *.pyc
 backend/app/data/*.db
+backend/app/data/*.db-shm
+backend/app/data/*.db-wal
 backend/debug_logs/
 frontend/dist/
 .DS_Store

@@ -30,23 +30,35 @@ DEFAULT_DB_PATH = os.path.join(BACKEND_DIR, "data", "trips.db")
 class EpisodicMemoryManager:
     def __init__(self, sqlite_path=DEFAULT_DB_PATH, qdrant_collection="user_feedback_v2"):
         self.sqlite_path = sqlite_path
+        print("[EpisodicMemoryManager] 开始初始化 SQLite", flush=True)
         self._init_sqlite()
+        print("[EpisodicMemoryManager] SQLite 初始化完成", flush=True)
         _configure_huggingface_retries()
 
         self.qdrant_collection = qdrant_collection
+        print(
+            f"[EpisodicMemoryManager] 开始创建 Qdrant client，collection={qdrant_collection}",
+            flush=True,
+        )
         self.qdrant_client = QdrantClient(
             url=os.getenv("QDRANT_URL"),
             api_key=os.getenv("QDRANT_API_KEY") or None,
             check_compatibility=False,
         )
+        print("[EpisodicMemoryManager] Qdrant client 创建完成", flush=True)
+        print("[EpisodicMemoryManager] 开始创建 embeddings", flush=True)
         self.embeddings = self._create_embeddings()
+        print("[EpisodicMemoryManager] embeddings 创建完成", flush=True)
+        print("[EpisodicMemoryManager] 开始检查 collection", flush=True)
         self._init_qdrant()
+        print("[EpisodicMemoryManager] collection 检查完成", flush=True)
 
         self.vector_store = QdrantVectorStore(
             client=self.qdrant_client,
             collection_name=self.qdrant_collection,
             embedding=self.embeddings
         )
+        print("[EpisodicMemoryManager] 初始化完成", flush=True)
 
     def _create_embeddings(self):
         provider = (os.getenv("EMBED_PROVIDER") or "auto").strip().lower()
@@ -114,7 +126,9 @@ class EpisodicMemoryManager:
         """建集合：准备存放向量化的评价，并建立高频过滤索引"""
         if not self.qdrant_client.collection_exists(self.qdrant_collection):
             print(f"🔡 正在创建情景记忆向量库 {self.qdrant_collection}")
+            print("[EpisodicMemoryManager] 开始 probe embedding 维度", flush=True)
             sample_vector = self.embeddings.embed_query("test")
+            print("[EpisodicMemoryManager] probe embedding 维度完成", flush=True)
             actual_dim = len(sample_vector)
 
             self.qdrant_client.create_collection(

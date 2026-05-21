@@ -1,4 +1,4 @@
-"""旅行规划API路由"""
+"""旅行规划API路由 .\venv\Scripts\Activate.ps1"""
 
 import uuid
 from fastapi import APIRouter, HTTPException
@@ -25,6 +25,7 @@ async def plan_trip(request: TripRequest):
             "success": True,
             "message": "旅行计划生成成功",
             "session_id": result["session_id"],
+            "user_id": result.get("user_id"),
             "data": result["plan"],
             "critic_scores": result.get("critic_scores"),
             "consumption_tier": result.get("consumption_tier")
@@ -51,6 +52,7 @@ async def refine_trip(req: RefineRequest):
             "success": True,
             "message": "精修完成",
             "session_id": result["session_id"],
+            "user_id": result.get("user_id"),
             "data": result["plan"],
             "critic_scores": result.get("critic_scores"),
             "consumption_tier": result.get("consumption_tier")
@@ -94,3 +96,6 @@ async def submit_trip_feedback(req: FeedbackRequest):
         return {"status": "success", "message": "记忆已成功刻入双引擎存储库。"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+

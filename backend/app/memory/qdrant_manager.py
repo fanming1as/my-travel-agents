@@ -69,15 +69,26 @@ class QdrantSemanticMemory:
         self.embedding_model_name = None
         self.embedding_dimension = None
 
+        print(f"[QdrantSemanticMemory] 开始创建 Qdrant client，collection={collection_name}", flush=True)
         self.client = self._create_qdrant_client()
+        print("[QdrantSemanticMemory] Qdrant client 创建完成", flush=True)
+        print("[QdrantSemanticMemory] 开始创建 embeddings", flush=True)
         self.embeddings = self._create_embeddings()
+        print(
+            f"[QdrantSemanticMemory] embeddings 创建完成，backend={self.embedding_backend}，"
+            f"model={self.embedding_model_name}，dim={self.embedding_dimension}",
+            flush=True,
+        )
+        print("[QdrantSemanticMemory] 开始检查 collection", flush=True)
         self._ensure_collection_ready()
+        print("[QdrantSemanticMemory] collection 检查完成", flush=True)
 
         self.vector_store = QdrantVectorStore(
             client=self.client,
             collection_name=self.collection_name,
             embedding=self.embeddings,
         )
+        print("[QdrantSemanticMemory] 初始化完成", flush=True)
 
     def _create_qdrant_client(self) -> QdrantClient:
         qdrant_url = (os.getenv("QDRANT_URL") or "").strip()
@@ -187,7 +198,12 @@ class QdrantSemanticMemory:
 
     def _probe_embedding_dimension(self, embeddings, backend: str, model_name: str) -> int:
         try:
+            print(
+                f"[QdrantSemanticMemory] 开始 probe embedding 维度，backend={backend}，model={model_name}",
+                flush=True,
+            )
             vector = embeddings.embed_query("dimension probe")
+            print("[QdrantSemanticMemory] probe embedding 维度完成", flush=True)
             return len(vector)
         except Exception as exc:
             raise RuntimeError(

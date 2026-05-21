@@ -356,7 +356,8 @@ import jsPDF from 'jspdf'
 import type { TripPlan, CriticScore } from '@/types'
 import { refineTrip } from '@/services/api'
 
-const currentUserId = ref('guest_user_123');
+const USER_ID_STORAGE_KEY = 'travel-agent-user-id'
+const currentUserId = ref(window.localStorage.getItem(USER_ID_STORAGE_KEY) || 'default_guest')
 const router = useRouter()
 const tripPlan = ref<TripPlan | null>(null)
 const editMode = ref(false)
@@ -382,6 +383,7 @@ onMounted(async () => {
     criticScores.value = res.critic_scores
     consumptionTier.value = res.consumption_tier
     sessionId.value = res.session_id
+    currentUserId.value = res.user_id || window.localStorage.getItem(USER_ID_STORAGE_KEY) || currentUserId.value
 
     await loadAttractionPhotos()
     await nextTick()
@@ -408,6 +410,7 @@ const handleRefine = async () => {
       tripPlan.value = res.data
       criticScores.value = res.critic_scores
       consumptionTier.value = res.consumption_tier || consumptionTier.value
+      currentUserId.value = res.user_id || currentUserId.value
 
       // 更新 sessionStorage
       sessionStorage.setItem('tripResponse', JSON.stringify(res))

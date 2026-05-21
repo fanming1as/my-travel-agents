@@ -10,17 +10,20 @@ import asyncio
 import json
 import math
 import os
+import re
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, TypedDict
 
 import httpx
 from dotenv import load_dotenv
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.types import Command, interrupt
 
 from ..memory.episodic_manager import EpisodicMemoryManager
+from ..memory.profile_manager import ProfileMemoryManager
 from ..memory.qdrant_manager import QdrantSemanticMemory
+from ..memory.sqlite_checkpointer import SQLiteCheckpointSaver
 from ..models.schemas import (
     Attraction,
     Budget,
@@ -55,6 +58,10 @@ _POI_RESULT_LIMITS = {
 }
 
 
+def _trace(message: str) -> None:
+    print(f"[TripPlanner {datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
+
+
 class TripGraphState(TypedDict, total=False):
     request: TripRequest
     user_id: str
@@ -62,6 +69,8 @@ class TripGraphState(TypedDict, total=False):
     spending_tier: str
     rag_knowledge: str
     user_memory: str
+    user_profile: Dict[str, Any]
+    user_profile_context: str
     poi_search_terms: Dict[str, List[str]]
     poi_candidates: Dict[str, List[Dict[str, Any]]]
     selected_pois: Dict[str, List[str]]
@@ -82,12 +91,16 @@ class GraphTripPlanner:
     def __init__(self):
         self.semantic_memory = QdrantSemanticMemory(collection_name="travel_guide")
         self.episodic_memory = EpisodicMemoryManager()
+        self.profile_memory = ProfileMemoryManager()
         self.sessions: Dict[str, State] = {}
-        self.checkpointer = MemorySaver()
+        self.checkpointer = SQLiteCheckpointSaver()
         self.graph_app = self._build_plan_graph()
+
 
     def _build_plan_graph(self):
         workflow = StateGraph(TripGraphState)
+        workflow.add_node("profile_update", self._node_profile_update)
+        workflow.add_node("profile_update_after_refinement", self._node_profile_update)
         workflow.add_node("knowledge_retrieval", self._node_knowledge_retrieval)
         workflow.add_node("poi_selector", self._node_poi_selector)
         workflow.add_node("gather_info", self._node_gather_info)
@@ -97,7 +110,8 @@ class GraphTripPlanner:
         workflow.add_node("await_refinement", self._node_await_refinement)
         workflow.add_node("refine_agent", self._node_refine_agent)
 
-        workflow.set_entry_point("knowledge_retrieval")
+        workflow.set_entry_point("profile_update")
+        workflow.add_edge("profile_update", "knowledge_retrieval")
         workflow.add_edge("knowledge_retrieval", "poi_selector")
         workflow.add_edge("poi_selector", "gather_info")
         workflow.add_edge("gather_info", "planner")
@@ -111,7 +125,8 @@ class GraphTripPlanner:
                 "await_refinement": "await_refinement",
             },
         )
-        workflow.add_edge("await_refinement", "refine_agent")
+        workflow.add_edge("await_refinement", "profile_update_after_refinement")
+        workflow.add_edge("profile_update_after_refinement", "refine_agent")
         workflow.add_conditional_edges(
             "refine_agent",
             self._route_after_refine,
@@ -123,7 +138,8 @@ class GraphTripPlanner:
                 END: END,
             },
         )
-        return workflow.compile(checkpointer=self.checkpointer)
+        graph = workflow.compile(checkpointer=self.checkpointer)
+        return graph
 
     async def _run_graph(
         self,
@@ -131,11 +147,13 @@ class GraphTripPlanner:
         entrypoint: Optional[str] = None,
         thread_id: Optional[str] = None,
     ) -> State:
-        if entrypoint and entrypoint != "knowledge_retrieval":
+        if entrypoint and entrypoint != "profile_update":
             raise ValueError("LangGraph runner only supports the configured entrypoint.")
         config = {"configurable": {"thread_id": thread_id or f"adhoc-{id(state)}"}}
-        return await self.graph_app.ainvoke(state, config=config)
+        result = await self.graph_app.ainvoke(state, config=config)
+        return result
 
+    #把用户的新反馈送回上一次 interrupt(...) 暂停的位置，让 LangGraph 继续跑
     async def _resume_graph(self, thread_id: str, user_message: str) -> State:
         return await self.graph_app.ainvoke(
             Command(resume=user_message),
@@ -155,6 +173,49 @@ class GraphTripPlanner:
         if resume_from in {"knowledge_retrieval", "poi_selector", "planner", "await_refinement", END}:
             return resume_from
         return "await_refinement"
+
+    def _coerce_trip_request(self, request: Any) -> Any:
+        if isinstance(request, TripRequest) or request is None:
+            return request
+        if isinstance(request, dict):
+            try:
+                return TripRequest(**request)
+            except Exception:
+                return request
+        return request
+
+    def _user_id_from_request(self, request: Any) -> str:
+        if isinstance(request, dict):
+            return request.get("user_id", "default_guest")
+        return getattr(request, "user_id", "default_guest")
+
+    def _restore_session_from_checkpoint(self, session_id: str) -> Optional[State]:
+        checkpoint_tuple = self.checkpointer.get_tuple(
+            {"configurable": {"thread_id": session_id}}
+        )
+        if checkpoint_tuple is None:
+            return None
+
+        persisted_state = dict(checkpoint_tuple.checkpoint.get("channel_values") or {})
+        request = self._coerce_trip_request(persisted_state.get("request"))
+        if request is not None:
+            persisted_state["request"] = request
+
+        session: State = {
+            "request": request,
+            "chat_history": list(persisted_state.get("chat_history") or []),
+            "final_plan": persisted_state.get("final_plan") or {},
+            "critic_scores": persisted_state.get("critic_scores"),
+            "spending_tier": persisted_state.get("spending_tier"),
+            "revision_count": persisted_state.get("revision_count", 0),
+            "user_profile": persisted_state.get("user_profile"),
+            "user_profile_context": persisted_state.get("user_profile_context"),
+        }
+        self.sessions[session_id] = session
+        return session
+
+    def _get_or_restore_session(self, session_id: str) -> Optional[State]:
+        return self.sessions.get(session_id) or self._restore_session_from_checkpoint(session_id)
 
     #根据用户的旅行需求，生成一个空的、标准的旅行行程框架
     def _create_basic_plan(self, request: TripRequest) -> TripPlan:
@@ -346,6 +407,139 @@ class GraphTripPlanner:
         if "自驾" in transportation or "打车" in transportation:
             return 180 * travel_days
         return 50 * travel_days
+
+    def _extract_profile_update_heuristic(self, text: str) -> Dict[str, Any]:
+        patch: Dict[str, Any] = {
+            "diet_avoid": [],
+            "travel_with": [],
+            "avoid": [],
+            "likes": [],
+        }
+        if not text:
+            return patch
+
+        diet_patterns = [
+            r"不吃([\u4e00-\u9fa5A-Za-z0-9]{1,12})",
+            r"不喜欢吃([\u4e00-\u9fa5A-Za-z0-9]{1,12})",
+            r"对([\u4e00-\u9fa5A-Za-z0-9]{1,12})过敏",
+            r"([\u4e00-\u9fa5A-Za-z0-9]{1,12})过敏",
+        ]
+        for pattern in diet_patterns:
+            for match in re.findall(pattern, text):
+                item = str(match).strip("，。,.、；; ")
+                if item and item not in patch["diet_avoid"]:
+                    patch["diet_avoid"].append(item)
+
+        if any(word in text for word in ("带小孩", "带孩子", "亲子", "儿童", "宝宝")):
+            patch["travel_with"].append("children")
+            patch["avoid"].append("高强度徒步")
+            patch["avoid"].append("太赶的行程")
+            patch["likes"].append("亲子友好")
+            patch["pace_preference"] = "relaxed"
+
+        if any(word in text for word in ("带老人", "老人同行", "父母同行")):
+            patch["travel_with"].append("elderly")
+            patch["avoid"].append("高强度徒步")
+            patch["avoid"].append("长时间步行")
+            patch["pace_preference"] = "relaxed"
+
+        if any(word in text for word in ("轻松", "慢一点", "别太累", "不要太累", "不想太赶", "别太赶", "午休")):
+            patch["pace_preference"] = "relaxed"
+            patch["avoid"].append("太赶的行程")
+
+        if any(word in text for word in ("特种兵", "高强度", "徒步", "爬山")) and any(
+            neg in text for neg in ("不", "别", "不要", "避免", "排雷")
+        ):
+            patch["avoid"].append("高强度徒步")
+
+        if any(word in text for word in ("省钱", "便宜", "经济", "低预算", "穷游")):
+            patch["budget_preference"] = "经济型"
+        elif any(word in text for word in ("高端", "豪华", "奢侈")):
+            patch["budget_preference"] = "奢侈型"
+
+        if "民宿" in text:
+            patch["hotel_preference"] = "民宿"
+        elif "经济型酒店" in text:
+            patch["hotel_preference"] = "经济型酒店"
+        elif "豪华酒店" in text:
+            patch["hotel_preference"] = "豪华酒店"
+
+        return patch
+
+    def _normalize_profile_update(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(raw, dict):
+            return {}
+        allowed_list_fields = ("diet_avoid", "travel_with", "avoid", "likes")
+        allowed_scalar_fields = ("pace_preference", "hotel_preference", "budget_preference")
+        normalized: Dict[str, Any] = {}
+        for field in allowed_list_fields:
+            values = raw.get(field, [])
+            if isinstance(values, str):
+                values = [values]
+            if isinstance(values, list):
+                normalized[field] = [
+                    str(value).strip()
+                    for value in values
+                    if value is not None and str(value).strip()
+                ][:10]
+        for field in allowed_scalar_fields:
+            value = raw.get(field)
+            if isinstance(value, str) and value.strip():
+                normalized[field] = value.strip()[:50]
+        return normalized
+
+    async def _extract_profile_update_with_llm(
+        self,
+        text: str,
+        current_profile: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not text.strip():
+            return {}
+
+        prompt = f"""
+请从用户文本中抽取适合长期保存的旅行画像。只保存稳定偏好，不要保存目的地、日期、一次性安排。
+只输出 JSON，不要输出解释、Markdown 或代码块。
+
+字段：
+- diet_avoid: 数组，用户明确不吃、忌口、过敏的食物
+- travel_with: 数组，例如 children、elderly、couple、solo
+- pace_preference: relaxed / normal / intense / null
+- avoid: 数组，用户长期想避免的内容，例如高强度徒步、太赶的行程
+- likes: 数组，用户长期喜欢的旅行内容，例如博物馆、亲子友好
+- hotel_preference: 字符串或 null
+- budget_preference: 经济型 / 舒适型 / 奢侈型 / null
+
+当前画像：{json.dumps(current_profile, ensure_ascii=False)}
+用户文本：{text}
+
+输出示例：
+{{"diet_avoid":["香菜"],"travel_with":["children"],"pace_preference":"relaxed","avoid":["高强度徒步"],"likes":["亲子友好"],"hotel_preference":null,"budget_preference":null}}
+""".strip()
+
+        raw_patch = await self._request_llm_json(
+            system_prompt="你只负责抽取长期用户画像，并且只返回合法 JSON。",
+            user_prompt=prompt,
+            max_tokens=500,
+        )
+        return self._normalize_profile_update(raw_patch)
+
+    def _merge_profile_patches(self, *patches: Dict[str, Any]) -> Dict[str, Any]:
+        merged: Dict[str, Any] = {
+            "diet_avoid": [],
+            "travel_with": [],
+            "avoid": [],
+            "likes": [],
+        }
+        for patch in patches:
+            patch = self._normalize_profile_update(patch)
+            for key in ("diet_avoid", "travel_with", "avoid", "likes"):
+                for value in patch.get(key, []):
+                    if value not in merged[key]:
+                        merged[key].append(value)
+            for key in ("pace_preference", "hotel_preference", "budget_preference"):
+                if patch.get(key):
+                    merged[key] = patch[key]
+        return merged
 
     def _to_location(self, raw_location: Any) -> Optional[Location]:
         if not isinstance(raw_location, dict):
@@ -688,11 +882,157 @@ class GraphTripPlanner:
             ],
         }
 
+    async def _refine_plan_structure_with_llm(
+        self,
+        request: TripRequest,
+        plan: TripPlan,
+        mcp_data: Dict[str, Any],
+        profile_context: str = "",
+    ) -> TripPlan:
+        """Apply structural refinements without inventing new POIs."""
+        free_text = getattr(request, "free_text_input", "") or ""
+        if "用户精修要求：" not in free_text:
+            return plan
+
+        attraction_lookup = {
+            attraction.name: attraction
+            for day in plan.days
+            for attraction in day.attractions
+        }
+        allowed_attraction_names = list(attraction_lookup.keys())
+        if not allowed_attraction_names:
+            return plan
+
+        prompt = f"""
+你是旅行行程结构精修助手。请根据用户精修要求，重新分配每天的景点结构。
+
+要求：
+1. 只输出 JSON，不要输出解释、Markdown 或代码块。
+2. 只能使用“可用景点”中的名字，不能编造新景点。
+3. 可以删除部分景点来降低强度，也可以把景点移动到其他天。
+4. 不要重复安排同一个景点。
+5. days 必须覆盖 0 到 {request.travel_days - 1} 的每一天。
+6. 如果用户要求某天更轻松，应减少该天景点数量。
+7. 如果用户没有要求改变某天，尽量保持该天原有安排。
+
+城市：{request.city}
+旅行天数：{request.travel_days}
+用户偏好：{"、".join(getattr(request, "preferences", []) or []) or "无"}
+用户补充需求：{free_text}
+长期画像：{profile_context or "该用户暂无长期画像。"}
+当前行程：{json.dumps(self._compact_plan_for_llm(plan), ensure_ascii=False)}
+可用景点：{json.dumps(allowed_attraction_names, ensure_ascii=False)}
+
+输出示例：
+{{"days":[{{"day_index":0,"attractions":["故宫","景山公园"]}},{{"day_index":1,"attractions":["南锣鼓巷"]}}]}}
+""".strip()
+
+        raw_update = await self._request_llm_json(
+            system_prompt="你只负责修改旅行行程结构，并且只返回合法 JSON。",
+            user_prompt=prompt,
+            max_tokens=900,
+        )
+        raw_days = raw_update.get("days") if isinstance(raw_update, dict) else None
+        if not isinstance(raw_days, list):
+            return plan
+
+        day_assignments: Dict[int, List[Attraction]] = {}
+        used_names: set[str] = set()
+
+        for item in raw_days:
+            if not isinstance(item, dict):
+                continue
+            try:
+                day_index = int(item.get("day_index"))
+            except (TypeError, ValueError):
+                continue
+            if day_index < 0 or day_index >= request.travel_days:
+                continue
+
+            raw_names = item.get("attractions")
+            if not isinstance(raw_names, list):
+                continue
+
+            selected: List[Attraction] = []
+            for raw_name in raw_names:
+                if not isinstance(raw_name, str):
+                    continue
+                name = raw_name.strip()
+                if not name or name in used_names or name not in attraction_lookup:
+                    continue
+                selected.append(attraction_lookup[name])
+                used_names.add(name)
+            day_assignments[day_index] = selected
+
+        if not day_assignments:
+            return plan
+
+        refined_plan = plan.model_copy(deep=True)
+        restaurant_pois = [
+            poi
+            for poi in ((mcp_data or {}).get("pois") or {}).get("restaurants", [])
+            if isinstance(poi, dict)
+        ]
+        meal_cost = self._estimate_meal_cost(request.spending_tier)
+        used_restaurant_keys: set = set()
+
+        for day in refined_plan.days:
+            day_attractions = day_assignments.get(day.day_index, day.attractions)
+            day.attractions = day_attractions
+            day.meals = self._build_meals_near_day_attractions(
+                request.city,
+                meal_cost,
+                restaurant_pois,
+                day_attractions,
+                day.hotel,
+                used_restaurant_keys,
+            )
+            day.description = self._build_day_description(
+                request,
+                day.day_index,
+                day_attractions,
+                day.meals,
+            )
+
+        total_attractions = sum(
+            attraction.ticket_price
+            for day in refined_plan.days
+            for attraction in day.attractions
+        )
+        total_hotels = sum(
+            day.hotel.estimated_cost
+            for day in refined_plan.days
+            if day.hotel is not None
+        )
+        total_meals = sum(
+            meal.estimated_cost
+            for day in refined_plan.days
+            for meal in day.meals
+        )
+        total_transportation = self._estimate_transportation_cost(
+            request.transportation,
+            request.travel_days,
+        )
+        refined_plan.budget = Budget(
+            total_attractions=total_attractions,
+            total_hotels=total_hotels,
+            total_meals=total_meals,
+            total_transportation=total_transportation,
+            total=(
+                total_attractions
+                + total_hotels
+                + total_meals
+                + total_transportation
+            ),
+        )
+        return refined_plan
+
     async def _optimize_plan_text_with_llm(
         self,
         request: TripRequest,
         plan: TripPlan,
         mcp_data: Dict[str, Any],
+        profile_context: str = "",
     ) -> TripPlan:
         prefs_text = "、".join(getattr(request, "preferences", []) or []) or "无"
         free_text = getattr(request, "free_text_input", "") or "无"
@@ -715,6 +1055,7 @@ class GraphTripPlanner:
 消费层级：{request.spending_tier}
 用户偏好：{prefs_text}
 用户补充需求：{free_text}
+长期画像：{profile_context or "该用户暂无长期画像。"}
 天气：{json.dumps(weather_payload, ensure_ascii=False)}
 当前行程：{json.dumps(self._compact_plan_for_llm(plan), ensure_ascii=False)}
 
@@ -867,25 +1208,68 @@ class GraphTripPlanner:
             ),
         )
 
+    #从用户当前请求和最近一句话里，提取长期偏好，并更新用户画像。
+    async def _node_profile_update(self, state: Dict[str, Any]):
+        request = state["request"]
+        user_id = state.get("user_id") or getattr(request, "user_id", "default_guest")
+        current_profile = self.profile_memory.get_profile(user_id)
+
+        message_parts = [
+            " ".join(getattr(request, "preferences", []) or []),
+            getattr(request, "free_text_input", "") or "",
+        ]
+        chat_history = state.get("chat_history") or []
+        if chat_history:
+            last_message = chat_history[-1]
+            if isinstance(last_message, dict) and last_message.get("role") == "human":
+                message_parts.append(str(last_message.get("content", "")))
+
+        profile_source_text = "\n".join(part for part in message_parts if part).strip()
+        heuristic_patch = self._extract_profile_update_heuristic(profile_source_text)
+        llm_patch = await self._extract_profile_update_with_llm(profile_source_text, current_profile)
+        patch = self._merge_profile_patches(heuristic_patch, llm_patch)
+
+        if self.profile_memory.has_profile_data(patch):
+            current_profile = self.profile_memory.update_profile(user_id, patch)
+
+        profile_context = self.profile_memory.format_profile(current_profile)
+        return {
+            "user_profile": current_profile,
+            "user_profile_context": profile_context,
+        }
+
     #先回忆用户历史偏好，再去知识库检索相关旅行内容，把两种上下文补进 state
     async def _node_knowledge_retrieval(self, state: Dict[str, Any]):
+        _trace("进入节点 knowledge_retrieval")
         request = state["request"]
         user_id = state.get("user_id", "default_guest")
         city = getattr(request, "city", "")
         prefs = getattr(request, "preferences", [])
         free_text = getattr(request, "free_text_input", "")
-
-        #基于用户当前需求的文本描述，捞取本人历史上最相关的吐槽或经验。（向量检索）
-        user_memory = self.episodic_memory.recall_lessons(
-            user_id, f"去{city}，偏好:{prefs}，要求:{free_text}"
+        profile_context = state.get("user_profile_context") or self.profile_memory.format_profile(
+            self.profile_memory.get_profile(user_id)
         )
 
-        query_text = f"{city} 景点 餐厅 酒店 {' '.join(prefs)} {free_text} {user_memory}"
-        #基于用户需求文本和历史记忆，从知识库捞取相关的旅行内容（RAG检索）
-        results = await self.semantic_memory.search_knowledge_async(query_text, k=4)
-        rag_knowledge = "\n\n".join(content for _, content in results)
+        #基于用户当前需求的文本描述，捞取本人历史上最相关的吐槽或经验。（向量检索）
+        _trace("knowledge_retrieval: 开始召回 episodic memory")
+        user_memory = self.episodic_memory.recall_lessons(
+            user_id, f"去{city}，偏好:{prefs}，要求:{free_text}，画像:{profile_context}"
+        )
+        _trace("knowledge_retrieval: episodic memory 召回完成")
 
-        return {"rag_knowledge": rag_knowledge, "user_memory": user_memory}
+        query_text = f"{city} 景点 餐厅 酒店 {' '.join(prefs)} {free_text} {profile_context} {user_memory}"
+        #基于用户需求文本和历史记忆，从知识库捞取相关的旅行内容（RAG检索）
+        _trace("knowledge_retrieval: 开始检索 semantic memory")
+        results = await self.semantic_memory.search_knowledge_async(query_text, k=4)
+        _trace("knowledge_retrieval: semantic memory 检索完成")
+        rag_knowledge = "\n\n".join(content for _, content in results)
+        _trace("离开节点 knowledge_retrieval")
+
+        return {
+            "rag_knowledge": rag_knowledge,
+            "user_memory": user_memory,
+            "user_profile_context": profile_context,
+        }
 
     def _fallback_pois(self, request: TripRequest) -> Dict[str, List[str]]:
         city = request.city
@@ -924,9 +1308,13 @@ class GraphTripPlanner:
 
         if any(word in user_text for word in ("博物馆", "历史", "文化", "展览", "人文")):
             self._append_unique_terms(attractions, ["博物馆", "历史文化景点"], 5)
-        if any(word in user_text for word in ("亲子", "儿童", "孩子", "乐园", "迪士尼")):
+        if any(word in user_text for word in ("亲子", "儿童", "孩子", "乐园", "迪士尼", "children")):
             self._append_unique_terms(attractions, ["亲子乐园", "主题乐园"], 5)
-        if any(word in user_text for word in ("自然", "公园", "徒步", "风景", "山水")):
+        avoid_hiking = any(word in user_text for word in ("避免：高强度徒步", "需要避免：高强度徒步", "避免高强度徒步", "不要徒步", "别徒步"))
+        nature_positive = any(word in user_text for word in ("自然", "公园", "风景", "山水")) or (
+            "徒步" in user_text and not avoid_hiking
+        )
+        if nature_positive:
             self._append_unique_terms(attractions, ["公园", "自然风景区"], 5)
         if any(word in user_text for word in ("夜景", "夜游", "晚上", "灯光")):
             self._append_unique_terms(attractions, ["夜景", "观景台"], 5)
@@ -989,6 +1377,7 @@ class GraphTripPlanner:
         model = os.getenv("LLM_MODEL_ID") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
 
         if not api_key:
+            _trace("跳过 LLM 请求：未配置 API key")
             return {}
 
         payload = {
@@ -1002,6 +1391,8 @@ class GraphTripPlanner:
         }
         timeout = float(os.getenv("LLM_TIMEOUT", "30"))
 
+        started_at = time.perf_counter()
+        _trace(f"开始请求 LLM，model={model}，max_tokens={max_tokens}")
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(
@@ -1015,9 +1406,14 @@ class GraphTripPlanner:
                 response.raise_for_status()
                 data = response.json()
                 content = data["choices"][0]["message"]["content"]
-        except Exception:
+        except Exception as exc:
+            _trace(
+                f"LLM 请求失败，耗时={time.perf_counter() - started_at:.2f}s，"
+                f"error={type(exc).__name__}: {exc}"
+            )
             return {}
 
+        _trace(f"LLM 请求完成，耗时={time.perf_counter() - started_at:.2f}s")
         return self._extract_json_object(content)
 
     #大模型输出的安全过滤器
@@ -1310,11 +1706,13 @@ class GraphTripPlanner:
 
     #用大模型理解用户想要什么，查询高德候选，再筛选出真实 POI
     async def _node_poi_selector(self, state: Dict[str, Any]):
+        _trace("进入节点 poi_selector")
         request = state["request"]
         rag_knowledge = state.get("rag_knowledge", "")
         user_memory = state.get("user_memory", "")
+        profile_context = state.get("user_profile_context", "")
 
-        context = "\n".join(part for part in (rag_knowledge, user_memory) if part)
+        context = "\n".join(part for part in (profile_context, rag_knowledge, user_memory) if part)
         fallback = self._fallback_pois(request)   #当大模型不可用或输出不合理时的兜底选项
         search_terms = await self._build_poi_search_terms_with_llm(request, context)
         candidate_result = await self._search_amap_poi_candidates(request, search_terms)
@@ -1326,6 +1724,7 @@ class GraphTripPlanner:
             fallback,
         )
 
+        _trace("离开节点 poi_selector")
         return {
             "poi_search_terms": search_terms,
             "poi_candidates": candidate_result["candidates"],
@@ -1466,6 +1865,7 @@ class GraphTripPlanner:
         return weather
 
     async def _node_gather_info(self, state: Dict[str, Any]):
+        _trace("进入节点 gather_info")
         request = state["request"]
         city = request.city
         selected_pois = state.get("selected_pois") or self._fallback_pois(request)
@@ -1507,6 +1907,7 @@ class GraphTripPlanner:
                     item.model_dump() for item in self._build_weather(request.start_date, request.travel_days)
                 ]
                 mcp_data["warnings"].append("AMAP_API_KEY 未配置，天气已使用本地兜底信息。")
+            _trace("离开节点 gather_info（复用已选 POI 详情）")
             return {"mcp_data": mcp_data}
 
         if not api_key:
@@ -1519,6 +1920,7 @@ class GraphTripPlanner:
                 item.model_dump() for item in self._build_weather(request.start_date, request.travel_days)
             ]
             mcp_data["warnings"].append("AMAP_API_KEY 未配置，已使用本地兜底信息。")
+            _trace("离开节点 gather_info（使用本地兜底数据）")
             return {"mcp_data": mcp_data}
 
         async with httpx.AsyncClient(timeout=6.0) as client:
@@ -1560,15 +1962,20 @@ class GraphTripPlanner:
 
             mcp_data["weather"] = await self._fetch_amap_weather(client, api_key, request)
 
+        _trace("离开节点 gather_info（完成外部信息查询）")
         return {"mcp_data": mcp_data}
 
     async def _node_planner(self, state: Dict[str, Any]):
+        _trace("进入节点 planner")
         request = state["request"]
         mcp_data = state.get("mcp_data") or {}
+        profile_context = state.get("user_profile_context", "")
         plan = self._create_plan_from_mcp_data(request, mcp_data)
         if plan is None:
             plan = self._create_demo_plan(request)
-        plan = await self._optimize_plan_text_with_llm(request, plan, mcp_data)
+        plan = await self._refine_plan_structure_with_llm(request, plan, mcp_data, profile_context)
+        plan = await self._optimize_plan_text_with_llm(request, plan, mcp_data, profile_context)
+        _trace("离开节点 planner")
         return {"final_plan": plan.model_dump()}
 
     def _build_rule_based_critic_scores(
@@ -1958,10 +2365,13 @@ refined_instruction 用一句话保留用户的具体修改要求，供后续节
             "critic_scores": state.get("critic_scores"),
             "spending_tier": request.spending_tier,
             "revision_count": state.get("revision_count", 0),
+            "user_profile": state.get("user_profile"),
+            "user_profile_context": state.get("user_profile_context"),
         }
 
         return {
             "session_id": session_id,
+            "user_id": getattr(request, "user_id", "default_guest"),
             "plan": plan,
             "critic_scores": state.get("critic_scores"),
             "consumption_tier": request.spending_tier,
@@ -1995,13 +2405,14 @@ refined_instruction 用一句话保留用户的具体修改要求，供后续节
 
         return {
             "session_id": session_id,
+            "user_id": getattr(session.get("request"), "user_id", "default_guest"),
             "plan": plan,
             "critic_scores": session.get("critic_scores"),
             "consumption_tier": session.get("spending_tier"),
         }
 
     async def refine_trip(self, session_id: str, user_message: str) -> dict:
-        session = self.sessions.get(session_id)
+        session = self._get_or_restore_session(session_id)
         if not session:
             return {
                 "session_id": session_id,
@@ -2031,16 +2442,22 @@ refined_instruction 用一句话保留用户的具体修改要求，供后续节
         session["spending_tier"] = state.get("spending_tier", session.get("spending_tier"))
         session["revision_count"] = state.get("revision_count", 0)
         session["chat_history"] = chat_history
+        session["user_profile"] = state.get("user_profile", session.get("user_profile"))
+        session["user_profile_context"] = state.get(
+            "user_profile_context",
+            session.get("user_profile_context"),
+        )
 
         return {
             "session_id": session_id,
+            "user_id": self._user_id_from_request(session.get("request")),
             "plan": plan,
             "critic_scores": session.get("critic_scores"),
             "consumption_tier": session.get("spending_tier"),
         }
 
     async def get_chat_history(self, session_id: str) -> list:
-        session = self.sessions.get(session_id, {})
+        session = self._get_or_restore_session(session_id) or {}
         return session.get("chat_history", [])
 
     def _create_fallback_plan(self, request: TripRequest) -> TripPlan:
@@ -2050,5 +2467,8 @@ refined_instruction 用一句话保留用户的具体修改要求，供后续节
 async def get_trip_planner_agent() -> GraphTripPlanner:
     global _graph_planner
     if _graph_planner is None:
+        _trace("首次请求，准备创建全局 GraphTripPlanner")
         _graph_planner = GraphTripPlanner()
+    else:
+        _trace("复用已有 GraphTripPlanner")
     return _graph_planner
