@@ -58,9 +58,6 @@ _POI_RESULT_LIMITS = {
 }
 
 
-def _trace(message: str) -> None:
-    print(f"[TripPlanner {datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
-
 
 class TripGraphState(TypedDict, total=False):
     request: TripRequest
@@ -1240,7 +1237,6 @@ class GraphTripPlanner:
 
     #先回忆用户历史偏好，再去知识库检索相关旅行内容，把两种上下文补进 state
     async def _node_knowledge_retrieval(self, state: Dict[str, Any]):
-        _trace("进入节点 knowledge_retrieval")
         request = state["request"]
         user_id = state.get("user_id", "default_guest")
         city = getattr(request, "city", "")
@@ -1251,19 +1247,14 @@ class GraphTripPlanner:
         )
 
         #基于用户当前需求的文本描述，捞取本人历史上最相关的吐槽或经验。（向量检索）
-        _trace("knowledge_retrieval: 开始召回 episodic memory")
         user_memory = self.episodic_memory.recall_lessons(
             user_id, f"去{city}，偏好:{prefs}，要求:{free_text}，画像:{profile_context}"
         )
-        _trace("knowledge_retrieval: episodic memory 召回完成")
 
         query_text = f"{city} 景点 餐厅 酒店 {' '.join(prefs)} {free_text} {profile_context} {user_memory}"
         #基于用户需求文本和历史记忆，从知识库捞取相关的旅行内容（RAG检索）
-        _trace("knowledge_retrieval: 开始检索 semantic memory")
         results = await self.semantic_memory.search_knowledge_async(query_text, k=4)
-        _trace("knowledge_retrieval: semantic memory 检索完成")
         rag_knowledge = "\n\n".join(content for _, content in results)
-        _trace("离开节点 knowledge_retrieval")
 
         return {
             "rag_knowledge": rag_knowledge,
@@ -1377,7 +1368,6 @@ class GraphTripPlanner:
         model = os.getenv("LLM_MODEL_ID") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
 
         if not api_key:
-            _trace("跳过 LLM 请求：未配置 API key")
             return {}
 
         payload = {
@@ -1392,7 +1382,6 @@ class GraphTripPlanner:
         timeout = float(os.getenv("LLM_TIMEOUT", "30"))
 
         started_at = time.perf_counter()
-        _trace(f"开始请求 LLM，model={model}，max_tokens={max_tokens}")
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(
@@ -1406,14 +1395,8 @@ class GraphTripPlanner:
                 response.raise_for_status()
                 data = response.json()
                 content = data["choices"][0]["message"]["content"]
-        except Exception as exc:
-            _trace(
-                f"LLM 请求失败，耗时={time.perf_counter() - started_at:.2f}s，"
-                f"error={type(exc).__name__}: {exc}"
-            )
-            return {}
 
-        _trace(f"LLM 请求完成，耗时={time.perf_counter() - started_at:.2f}s")
+
         return self._extract_json_object(content)
 
     #大模型输出的安全过滤器
@@ -1706,7 +1689,6 @@ class GraphTripPlanner:
 
     #用大模型理解用户想要什么，查询高德候选，再筛选出真实 POI
     async def _node_poi_selector(self, state: Dict[str, Any]):
-        _trace("进入节点 poi_selector")
         request = state["request"]
         rag_knowledge = state.get("rag_knowledge", "")
         user_memory = state.get("user_memory", "")
@@ -1724,7 +1706,6 @@ class GraphTripPlanner:
             fallback,
         )
 
-        _trace("离开节点 poi_selector")
         return {
             "poi_search_terms": search_terms,
             "poi_candidates": candidate_result["candidates"],
@@ -1865,7 +1846,6 @@ class GraphTripPlanner:
         return weather
 
     async def _node_gather_info(self, state: Dict[str, Any]):
-        _trace("进入节点 gather_info")
         request = state["request"]
         city = request.city
         selected_pois = state.get("selected_pois") or self._fallback_pois(request)
@@ -1907,7 +1887,6 @@ class GraphTripPlanner:
                     item.model_dump() for item in self._build_weather(request.start_date, request.travel_days)
                 ]
                 mcp_data["warnings"].append("AMAP_API_KEY 未配置，天气已使用本地兜底信息。")
-            _trace("离开节点 gather_info（复用已选 POI 详情）")
             return {"mcp_data": mcp_data}
 
         if not api_key:
@@ -1919,8 +1898,7 @@ class GraphTripPlanner:
             mcp_data["weather"] = [
                 item.model_dump() for item in self._build_weather(request.start_date, request.travel_days)
             ]
-            mcp_data["warnings"].append("AMAP_API_KEY 未配置，已使用本地兜底信息。")
-            _trace("离开节点 gather_info（使用本地兜底数据）")
+            mcp_data["warnings"].append("AMAP_API_KEY 未配置，已使用本地兜底信息。")")
             return {"mcp_data": mcp_data}
 
         async with httpx.AsyncClient(timeout=6.0) as client:
@@ -1962,11 +1940,9 @@ class GraphTripPlanner:
 
             mcp_data["weather"] = await self._fetch_amap_weather(client, api_key, request)
 
-        _trace("离开节点 gather_info（完成外部信息查询）")
         return {"mcp_data": mcp_data}
 
     async def _node_planner(self, state: Dict[str, Any]):
-        _trace("进入节点 planner")
         request = state["request"]
         mcp_data = state.get("mcp_data") or {}
         profile_context = state.get("user_profile_context", "")
@@ -1975,7 +1951,6 @@ class GraphTripPlanner:
             plan = self._create_demo_plan(request)
         plan = await self._refine_plan_structure_with_llm(request, plan, mcp_data, profile_context)
         plan = await self._optimize_plan_text_with_llm(request, plan, mcp_data, profile_context)
-        _trace("离开节点 planner")
         return {"final_plan": plan.model_dump()}
 
     def _build_rule_based_critic_scores(
@@ -2467,8 +2442,6 @@ refined_instruction 用一句话保留用户的具体修改要求，供后续节
 async def get_trip_planner_agent() -> GraphTripPlanner:
     global _graph_planner
     if _graph_planner is None:
-        _trace("首次请求，准备创建全局 GraphTripPlanner")
         _graph_planner = GraphTripPlanner()
     else:
-        _trace("复用已有 GraphTripPlanner")
     return _graph_planner
